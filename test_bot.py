@@ -58,8 +58,8 @@ def test_repeated_image_set_accumulates_strikes():
 def test_purge_stale():
     now = datetime.now(timezone.utc)
     tracked = {
-        123: {"last_seen": now - timedelta(minutes=11)},
-        456: {"last_seen": now - timedelta(minutes=1)},
+        123: {"created_at": now - timedelta(minutes=11)},
+        456: {"created_at": now - timedelta(minutes=1)},
     }
 
     removed = purge_stale(tracked, ttl_minutes=10, now=now)

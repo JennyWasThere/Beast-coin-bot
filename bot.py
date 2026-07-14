@@ -46,7 +46,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-tracked_users = {}  # user_id -> {username, hashes: [imagehash,...], strikes, last_seen}
+tracked_users = {}  # user_id -> {username, hashes: [imagehash,...], strikes, created_at}
 
 
 def is_match(hash1, hash2, threshold=HASH_THRESHOLD):
@@ -58,10 +58,9 @@ def track_hash(img_hash, username, user_id, tracked=None):
     tracked = tracked_users if tracked is None else tracked
     record = tracked.get(user_id)
     if record is None:
-        record = {"username": username, "hashes": [], "strikes": 0, "last_seen": None, "alerted": False}
+        record = {"username": username, "hashes": [], "strikes": 0, "created_at": datetime.now(timezone.utc), "alerted": False}
         tracked[user_id] = record
     record["username"] = username
-    record["last_seen"] = datetime.now(timezone.utc)
     if any(is_match(img_hash, seen) for seen in record["hashes"]):
         record["strikes"] += 1
     else:
@@ -71,7 +70,7 @@ def track_hash(img_hash, username, user_id, tracked=None):
 
 def purge_stale(tracked, ttl_minutes, now):
     cutoff = now - timedelta(minutes=ttl_minutes)
-    stale_keys = [key for key, record in tracked.items() if record["last_seen"] < cutoff]
+    stale_keys = [key for key, record in tracked.items() if record["created_at"] < cutoff]
     for key in stale_keys:
         del tracked[key]
     return len(stale_keys)
