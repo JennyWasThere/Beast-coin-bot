@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -13,11 +14,34 @@ from PIL import Image
 load_dotenv()
 
 TOKEN = os.environ.get("DISCORD_TOKEN", "")
-ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID") or "0")
-LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID") or "0")
-HASH_THRESHOLD = int(os.environ.get("HASH_THRESHOLD", "5"))
-TRACK_TTL_MINUTES = 10  # how long a tracked entry survives; also the cleanup sweep interval
-STRIKE_LIMIT = 12
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")  # persists settings changed via slash commands across restarts
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config():
+    with open(CONFIG_PATH, "w") as f:
+        json.dump({
+            "sweep_interval_minutes": TRACK_TTL_MINUTES,
+            "strike_limit": STRIKE_LIMIT,
+            "hash_threshold": HASH_THRESHOLD,
+            "alert_channel_id": ALERT_CHANNEL_ID,
+            "log_channel_id": LOG_CHANNEL_ID,
+        }, f)
+
+
+_config = load_config()
+TRACK_TTL_MINUTES = _config.get("sweep_interval_minutes", 10)  # how long a tracked entry survives; also the cleanup sweep interval, both adjustable via slash commands
+STRIKE_LIMIT = _config.get("strike_limit", 12)
+HASH_THRESHOLD = _config.get("hash_threshold", 5)
+ALERT_CHANNEL_ID = _config.get("alert_channel_id") or int(os.environ.get("ALERT_CHANNEL_ID") or "0")
+LOG_CHANNEL_ID = _config.get("log_channel_id") or int(os.environ.get("LOG_CHANNEL_ID") or "0")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("image-watch")
@@ -26,13 +50,12 @@ log = logging.getLogger("image-watch")
 class DiscordLogHandler(logging.Handler):
     """Mirrors log records to a Discord channel. emit() is sync, so sending is scheduled as a task."""
 
-    def __init__(self, bot, channel_id):
+    def __init__(self, bot):
         super().__init__()
         self.bot = bot
-        self.channel_id = channel_id
 
     def emit(self, record):
-        channel = self.bot.get_channel(self.channel_id)
+        channel = self.bot.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
         if channel:
             self.bot.loop.create_task(self._send(channel, self.format(record)))
 
@@ -49,7 +72,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tracked_users = {}  # user_id -> {username, hashes: [imagehash,...], strikes, created_at}
 
 
-def is_match(hash1, hash2, threshold=HASH_THRESHOLD):
+def is_match(hash1, hash2, threshold):
     return (hash1 - hash2) <= threshold
 
 
@@ -61,7 +84,7 @@ def track_hash(img_hash, username, user_id, tracked=None):
         record = {"username": username, "hashes": [], "strikes": 0, "created_at": datetime.now(timezone.utc), "alerted": False}
         tracked[user_id] = record
     record["username"] = username
-    if any(is_match(img_hash, seen) for seen in record["hashes"]):
+    if any(is_match(img_hash, seen, HASH_THRESHOLD) for seen in record["hashes"]):
         record["strikes"] += 1
     else:
         record["hashes"].append(img_hash)
@@ -85,13 +108,76 @@ async def cleanup_tracked_hashes():
 
 @bot.event
 async def on_ready():
-    if LOG_CHANNEL_ID and not any(isinstance(h, DiscordLogHandler) for h in log.handlers):
-        handler = DiscordLogHandler(bot, LOG_CHANNEL_ID)
+    if not any(isinstance(h, DiscordLogHandler) for h in log.handlers):
+        handler = DiscordLogHandler(bot)
         handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
         log.addHandler(handler)
     if not cleanup_tracked_hashes.is_running():
         cleanup_tracked_hashes.start()
+    await bot.tree.sync()
     log.info("Logged in as %s", bot.user)
+
+
+@bot.tree.command(name="purge", description="Manually purge stale tracked users now")
+@discord.app_commands.default_permissions(manage_guild=True)
+async def purge_command(interaction: discord.Interaction):
+    removed = purge_stale(tracked_users, TRACK_TTL_MINUTES, datetime.now(timezone.utc))
+    await interaction.response.send_message(f"Purged {removed} stale tracked user(s).", ephemeral=True)
+
+
+@bot.tree.command(name="set-strike-threshold", description="Set how many strikes trigger an alert")
+@discord.app_commands.default_permissions(manage_guild=True)
+async def set_strike_threshold_command(interaction: discord.Interaction, threshold: int):
+    global STRIKE_LIMIT
+    if threshold < 1:
+        await interaction.response.send_message("Threshold must be at least 1.", ephemeral=True)
+        return
+    STRIKE_LIMIT = threshold
+    save_config()
+    await interaction.response.send_message(f"Strike threshold set to {threshold}.", ephemeral=True)
+
+
+@bot.tree.command(name="set-hash-threshold", description="Set how close two images' hashes must be to count as a match")
+@discord.app_commands.default_permissions(manage_guild=True)
+async def set_hash_threshold_command(interaction: discord.Interaction, threshold: int):
+    global HASH_THRESHOLD
+    if threshold < 0:
+        await interaction.response.send_message("Threshold must be at least 0.", ephemeral=True)
+        return
+    HASH_THRESHOLD = threshold
+    save_config()
+    await interaction.response.send_message(f"Hash threshold set to {threshold}.", ephemeral=True)
+
+
+@bot.tree.command(name="set-sweep-interval", description="Set how often (in minutes) stale tracked users are purged")
+@discord.app_commands.default_permissions(manage_guild=True)
+async def set_sweep_interval_command(interaction: discord.Interaction, minutes: int):
+    global TRACK_TTL_MINUTES
+    if minutes < 1:
+        await interaction.response.send_message("Interval must be at least 1 minute.", ephemeral=True)
+        return
+    TRACK_TTL_MINUTES = minutes
+    save_config()
+    cleanup_tracked_hashes.change_interval(minutes=minutes)
+    await interaction.response.send_message(f"Sweep interval set to {minutes} minute(s).", ephemeral=True)
+
+
+@bot.tree.command(name="set-alert-channel", description="Set the channel where strike alerts are forwarded")
+@discord.app_commands.default_permissions(manage_guild=True)
+async def set_alert_channel_command(interaction: discord.Interaction, channel: discord.TextChannel):
+    global ALERT_CHANNEL_ID
+    ALERT_CHANNEL_ID = channel.id
+    save_config()
+    await interaction.response.send_message(f"Alert channel set to {channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="set-log-channel", description="Set the channel where bot logs are mirrored")
+@discord.app_commands.default_permissions(manage_guild=True)
+async def set_log_channel_command(interaction: discord.Interaction, channel: discord.TextChannel):
+    global LOG_CHANNEL_ID
+    LOG_CHANNEL_ID = channel.id
+    save_config()
+    await interaction.response.send_message(f"Log channel set to {channel.mention}.", ephemeral=True)
 
 
 async def handle_strike_limit(message, record):
