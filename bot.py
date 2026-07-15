@@ -118,6 +118,23 @@ async def on_ready():
     log.info("Logged in as %s", bot.user)
 
 
+GITHUB_URL = "https://github.com/JennyWasThere/Beast-coin-bot"
+
+
+@bot.tree.command(name="github", description="Get the link to this bot's source code")
+@discord.app_commands.checks.cooldown(1, 60.0)
+async def github_command(interaction: discord.Interaction):
+    await interaction.response.send_message(GITHUB_URL)
+
+
+@github_command.error
+async def github_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
+    if isinstance(error, discord.app_commands.CommandOnCooldown):
+        await interaction.response.send_message(str(error), ephemeral=True)
+    else:
+        raise error
+
+
 @bot.tree.command(name="purge", description="Manually purge stale tracked users now")
 @discord.app_commands.default_permissions(manage_guild=True)
 async def purge_command(interaction: discord.Interaction):
