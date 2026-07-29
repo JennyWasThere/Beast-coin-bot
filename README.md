@@ -1,42 +1,59 @@
 # Beast Coin Bot
 
-A Discord bot that watches for image spam. When someone posts the same (or a
-near-identical) picture over and over, the bot quietly keeps count, and once
-they've done it too many times it forwards one of their messages to a mod
-alert channel so a human can take a look.
+The bot watches for image spam. A user can post the same picture, or a
+near-identical one, many times. The bot counts these posts. After too many
+repeats, the bot forwards one of the user's messages to a mod channel. A
+human then reviews it.
 
-It doesn't delete anything or ban anyone automatically, it just flags
-repeat offenders for review.
+The bot also watches for honeypot bans. When the moderation bot posts a ban
+notice for a honeypot trigger, this bot forwards that notice to a ban log
+channel.
+
+The bot does not delete messages. The bot does not ban users. The bot only
+flags repeat offenders and forwards ban notices for review.
 
 ## How it works
 
-- Every image posted in a server is fingerprinted (a "perceptual hash") so
-  visually similar images are recognized even if they've been resized or
-  slightly edited.
-- If the same person posts a matching image again, that counts as a strike.
-- Once a user racks up enough strikes, their message gets forwarded to a
-  designated alert channel.
-- Strike history is temporary, a user's record resets automatically after a
-  set amount of time (the "sweep interval").
+### Image spam detection
+
+- The bot fingerprints every image posted in a server. This fingerprint is
+  a "perceptual hash." The hash matches visually similar images, even after
+  a resize or a small edit.
+- A repost of a matching image counts as a strike for that user.
+- After a user reaches the strike limit, the bot forwards their message to
+  the mod channel.
+- Strike history is temporary. A user's record resets after a set time (the
+  "sweep interval").
+
+### Honeypot ban forwarding
+
+- The bot watches the bot log channel for moderation-bot messages.
+- When a message embed contains the phrase "Triggered honeypot channel,"
+  the bot forwards it to the ban log channel.
 
 ## Commands
 
 - `/about`: link to this repo.
-- `/purge`: manually clear out stale tracked users right now.
-- `/set-strike-threshold`: how many matching posts before an alert fires.
-- `/set-hash-threshold`: how similar two images must be to count as a match.
-- `/set-sweep-interval`: how long (in minutes) a user's history is kept.
-- `/set-alert-channel`: where flagged messages get forwarded.
-- `/set-log-channel`: where the bot's internal logs get mirrored.
+- `/purge`: clear out stale tracked users now.
+- `/set-strike-threshold`: set how many matching posts trigger an alert.
+- `/set-hash-threshold`: set how similar two images must be to count as a
+  match.
+- `/set-sweep-interval`: set how long (in minutes) the bot keeps a user's
+  strike history.
+- `/set-mod-channel`: set where flagged messages get forwarded.
+- `/set-bot-log-channel`: set where the bot's internal logs get mirrored,
+  and where the bot watches for honeypot ban notices.
+- `/set-ban-log-channel`: set where honeypot ban notices get forwarded.
 
-The `set-*` and `purge` commands require "Manage Server" permission.
+The `set-*` and `purge` commands require the "Manage Server" permission.
 
 ## Setup
 
-1. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN` (and optionally
-   `ALERT_CHANNEL_ID` / `LOG_CHANNEL_ID` as defaults).
-2. `pip install -r requirements.txt`
-3. `python bot.py`
+1. Copy `.env.example` to `.env`. Fill in `DISCORD_TOKEN`. Optionally set
+   `MOD_CHANNEL_ID`, `BOT_LOG_CHANNEL_ID`, and `BAN_LOG_CHANNEL_ID` as
+   defaults.
+2. Run `pip install -r requirements.txt`.
+3. Run `python bot.py`.
 
-Settings changed via slash commands are saved to `config.json` and survive
-restarts.
+Settings changed through slash commands save to `config.json`. These
+settings survive restarts.
