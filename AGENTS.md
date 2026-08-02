@@ -1,7 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-Behavioral guidelines for working in this repo. Adapted from
-[andrej-karpathy-skills/CLAUDE.md](https://github.com/multica-ai/andrej-karpathy-skills/blob/main/CLAUDE.md).
+Behavioral guidelines for any agentic coding assistant working in this repo.
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
