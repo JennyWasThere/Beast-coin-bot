@@ -169,11 +169,12 @@ async def about_command_error(interaction: discord.Interaction, error: discord.a
         raise error
 
 
-@bot.tree.command(name="purge", description="Manually purge stale tracked users now")
+@bot.tree.command(name="purge", description="Manually purge all tracked users now")
 @discord.app_commands.default_permissions(manage_guild=True)
 async def purge_command(interaction: discord.Interaction):
-    removed = purge_stale(tracked_users, config["sweep_interval_minutes"], datetime.now(timezone.utc))
-    await interaction.response.send_message(f"Purged {len(removed)} stale tracked user(s).", ephemeral=True)
+    removed = list(tracked_users.items())
+    tracked_users.clear()
+    await interaction.response.send_message(f"Purged {len(removed)} tracked user(s).", ephemeral=True)
     if removed:
         await report_expired_activity(removed)
 
