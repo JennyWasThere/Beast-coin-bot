@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import imagehash
 
-from bot import is_match, purge_stale, track_hash
+from bot import format_activity_report, is_match, purge_stale, track_hash
 
 
 def test_is_match():
@@ -55,6 +55,21 @@ def test_repeated_image_set_accumulates_strikes():
     assert tracked[123]["strikes"] == 8
 
 
+def test_track_hash_records_activity():
+    tracked = {}
+    a = imagehash.hex_to_hash("ffff0000ffff0000")
+    b = imagehash.hex_to_hash("0000ffff0000ffff")
+    sent_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    track_hash(a, "spammer", 123, tracked, channel_name="memes", sent_at=sent_at)
+    track_hash(b, "spammer", 123, tracked, channel_name="general", sent_at=sent_at)
+
+    assert tracked[123]["activity"] == [
+        {"time": sent_at, "channel": "memes"},
+        {"time": sent_at, "channel": "general"},
+    ]
+
+
 def test_purge_stale():
     now = datetime.now(timezone.utc)
     tracked = {
@@ -64,13 +79,30 @@ def test_purge_stale():
 
     removed = purge_stale(tracked, ttl_minutes=10, now=now)
 
-    assert removed == 1
+    assert len(removed) == 1
+    assert removed[0][0] == 123
     assert list(tracked) == [456]
+
+
+def test_format_activity_report():
+    record = {
+        "username": "spammer",
+        "activity": [
+            {"time": datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc), "channel": "memes"},
+            {"time": datetime(2024, 1, 1, 12, 5, tzinfo=timezone.utc), "channel": "general"},
+        ],
+    }
+
+    report = format_activity_report(record)
+
+    assert report == "spammer:\nmemes : 2024-01-01 12:00:00\ngeneral : 2024-01-01 12:05:00"
 
 
 if __name__ == "__main__":
     test_is_match()
     test_track_hash()
     test_repeated_image_set_accumulates_strikes()
+    test_track_hash_records_activity()
     test_purge_stale()
+    test_format_activity_report()
     print("ok")

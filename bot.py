@@ -85,14 +85,16 @@ def is_match(hash1, hash2, threshold):
     return (hash1 - hash2) <= threshold
 
 
-def track_hash(img_hash, username, user_id, tracked=None):
+def track_hash(img_hash, username, user_id, tracked=None, channel_name=None, sent_at=None):
     """Record img_hash against user_id. Strikes only when this user has posted a fuzzy-matching image before."""
     tracked = tracked_users if tracked is None else tracked
     record = tracked.get(user_id)
     if record is None:
-        record = {"username": username, "hashes": [], "strikes": 0, "created_at": datetime.now(timezone.utc), "alerted": False}
+        record = {"username": username, "hashes": [], "strikes": 0, "created_at": datetime.now(timezone.utc), "alerted": False, "activity": []}
         tracked[user_id] = record
     record["username"] = username
+    if channel_name:
+        record["activity"].append({"time": sent_at or datetime.now(timezone.utc), "channel": channel_name})
     if any(is_match(img_hash, seen, config["hash_threshold"]) for seen in record["hashes"]):
         record["strikes"] += 1
     else:
@@ -103,16 +105,39 @@ def track_hash(img_hash, username, user_id, tracked=None):
 def purge_stale(tracked, ttl_minutes, now):
     cutoff = now - timedelta(minutes=ttl_minutes)
     stale_keys = [key for key, record in tracked.items() if record["created_at"] < cutoff]
+    removed = []
     for key in stale_keys:
-        del tracked[key]
-    return len(stale_keys)
+        removed.append((key, tracked.pop(key)))
+    return removed
+
+
+def format_activity_report(record):
+    """Return a user's activity as one 'channel : time' line per entry."""
+    lines = [f"{entry['channel']} : {entry['time'].strftime('%Y-%m-%d %H:%M:%S')}" for entry in record["activity"]]
+    return "\n".join([f"{record['username']}:"] + lines)
+
+
+async def report_expired_activity(records):
+    """Log each removed user's activity to the bot log channel when they met the strike limit."""
+    channel = bot.get_channel(config["bot_log_channel_id"]) if config["bot_log_channel_id"] else None
+    if not channel:
+        return
+    for _, record in records:
+        if record["strikes"] < config["strike_limit"]:
+            continue
+        try:
+            await channel.send(format_activity_report(record)[:2000])
+        except discord.HTTPException:
+            log.exception("Failed to send activity report to bot log channel")
 
 
 @tasks.loop(minutes=config["sweep_interval_minutes"])
 async def cleanup_tracked_hashes():
     removed = purge_stale(tracked_users, config["sweep_interval_minutes"], datetime.now(timezone.utc))
-    if removed:
-        log.info("Cleaned up %d stale tracked user(s)", removed)
+    if not removed:
+        return
+    log.info("Cleaned up %d stale tracked user(s)", len(removed))
+    await report_expired_activity(removed)
 
 
 @bot.event
@@ -148,7 +173,9 @@ async def about_command_error(interaction: discord.Interaction, error: discord.a
 @discord.app_commands.default_permissions(manage_guild=True)
 async def purge_command(interaction: discord.Interaction):
     removed = purge_stale(tracked_users, config["sweep_interval_minutes"], datetime.now(timezone.utc))
-    await interaction.response.send_message(f"Purged {removed} stale tracked user(s).", ephemeral=True)
+    await interaction.response.send_message(f"Purged {len(removed)} stale tracked user(s).", ephemeral=True)
+    if removed:
+        await report_expired_activity(removed)
 
 
 @bot.tree.command(name="set-strike-threshold", description="Set how many strikes trigger an alert")
@@ -283,7 +310,7 @@ async def on_message(message):
             log.warning("Could not hash attachment %s: %s", attachment.filename, e)
             continue
 
-        record = track_hash(img_hash, str(message.author), message.author.id)
+        record = track_hash(img_hash, str(message.author), message.author.id, channel_name=message.channel.name, sent_at=message.created_at)
 
     if record and record["strikes"] >= config["strike_limit"]:
         await handle_strike_limit(message, record)
