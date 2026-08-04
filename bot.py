@@ -85,7 +85,7 @@ def is_match(hash1, hash2, threshold):
     return (hash1 - hash2) <= threshold
 
 
-def track_hash(img_hash, username, user_id, tracked=None, channel_name=None, sent_at=None):
+def track_hash(img_hash, username, user_id, tracked=None):
     """Record img_hash against user_id. Strikes only when this user has posted a fuzzy-matching image before."""
     tracked = tracked_users if tracked is None else tracked
     record = tracked.get(user_id)
@@ -93,8 +93,6 @@ def track_hash(img_hash, username, user_id, tracked=None, channel_name=None, sen
         record = {"username": username, "hashes": [], "strikes": 0, "created_at": datetime.now(timezone.utc), "alerted": False, "activity": []}
         tracked[user_id] = record
     record["username"] = username
-    if channel_name:
-        record["activity"].append({"time": sent_at or datetime.now(timezone.utc), "channel": channel_name})
     if any(is_match(img_hash, seen, config["hash_threshold"]) for seen in record["hashes"]):
         record["strikes"] += 1
     else:
@@ -311,7 +309,10 @@ async def on_message(message):
             log.warning("Could not hash attachment %s: %s", attachment.filename, e)
             continue
 
-        record = track_hash(img_hash, str(message.author), message.author.id, channel_name=message.channel.name, sent_at=message.created_at)
+        record = track_hash(img_hash, str(message.author), message.author.id)
+
+    if record:
+        record["activity"].append({"time": message.created_at, "channel": message.channel.name})
 
     if record and record["strikes"] >= config["strike_limit"]:
         await handle_strike_limit(message, record)

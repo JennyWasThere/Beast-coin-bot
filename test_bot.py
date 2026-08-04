@@ -55,19 +55,15 @@ def test_repeated_image_set_accumulates_strikes():
     assert tracked[123]["strikes"] == 8
 
 
-def test_track_hash_records_activity():
+def test_track_hash_does_not_record_activity():
     tracked = {}
     a = imagehash.hex_to_hash("ffff0000ffff0000")
     b = imagehash.hex_to_hash("0000ffff0000ffff")
-    sent_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
-    track_hash(a, "spammer", 123, tracked, channel_name="memes", sent_at=sent_at)
-    track_hash(b, "spammer", 123, tracked, channel_name="general", sent_at=sent_at)
+    track_hash(a, "spammer", 123, tracked)
+    track_hash(b, "spammer", 123, tracked)
 
-    assert tracked[123]["activity"] == [
-        {"time": sent_at, "channel": "memes"},
-        {"time": sent_at, "channel": "general"},
-    ]
+    assert tracked[123]["activity"] == []
 
 
 def test_purge_stale():
@@ -102,7 +98,7 @@ if __name__ == "__main__":
     test_is_match()
     test_track_hash()
     test_repeated_image_set_accumulates_strikes()
-    test_track_hash_records_activity()
+    test_track_hash_does_not_record_activity()
     test_purge_stale()
     test_format_activity_report()
     print("ok")
