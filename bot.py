@@ -256,6 +256,9 @@ async def forward_to(message, channel_id, label):
     try:
         await message.forward(channel)
         return True
+    except discord.Forbidden:
+        log.warning("Missing permissions to forward to %s channel %s", label, channel_id)
+        return False
     except discord.HTTPException:
         log.exception("Failed to forward message to %s channel", label)
         return False
