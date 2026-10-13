@@ -25,6 +25,16 @@ flags repeat offenders and forwards ban notices for review.
 - Strike history is temporary. A user's record resets after a set time (the
   "sweep interval").
 
+### Watched images
+
+- A mod can point the bot at one known-bad post with `/hash-image` and a
+  message link. The bot fingerprints each image in that post. It saves these
+  fingerprints to disk.
+- Any later repost of a watched image, in any channel, forwards that message
+  to the mod channel. The bot alerts once per user per watched image, within
+  the sweep window.
+- Watched images survive restarts. `/clear-hashes` wipes them all.
+
 ### Honeypot ban forwarding
 
 - The bot watches the bot log channel for moderation-bot messages.
@@ -44,8 +54,12 @@ flags repeat offenders and forwards ban notices for review.
 - `/set-bot-log-channel`: set where the bot's internal logs get mirrored,
   and where the bot watches for honeypot ban notices.
 - `/set-ban-log-channel`: set where honeypot ban notices get forwarded.
+- `/hash-image`: add the images in a message from this server to the watch
+  list.
+- `/clear-hashes`: wipe every watched image hash.
 
-The `set-*` and `purge` commands require the "Manage Server" permission.
+The `set-*`, `hash-image`, `clear-hashes`, and `purge` commands require the
+"Manage Server" permission.
 
 ## Setup
 
@@ -55,5 +69,6 @@ The `set-*` and `purge` commands require the "Manage Server" permission.
 2. Run `pip install -r requirements.txt`.
 3. Run `python bot.py`.
 
-Settings changed through slash commands save to `config.json`. These
-settings survive restarts.
+Settings changed through slash commands save to `config.json`. Watched image
+hashes save to `hashes.json`, in the same directory as `config.json`. These
+files survive restarts when `config.json` sits on a mounted volume.

@@ -15,6 +15,7 @@ load_dotenv()
 
 TOKEN = os.environ.get("DISCORD_TOKEN", "")
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")  # persists settings changed via slash commands across restarts
+HASHES_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "hashes.json")  # watched image hashes; next to config so it shares the mounted volume
 
 
 DEFAULT_CONFIG = {
@@ -33,27 +34,55 @@ CHANNEL_ENV_VARS = {
 }
 
 
-def load_config():
+def load_json(path, default):
     try:
-        with open(CONFIG_PATH) as f:
-            loaded = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        loaded = {}
-    merged = {**DEFAULT_CONFIG, **loaded}
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError:
+        log.warning("Could not parse %s; using the default value", path)
+        return default
+
+
+def save_json(path, data):
+    """Write through a temp file. A crash mid-write must not truncate the saved data."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def load_config():
+    merged = {**DEFAULT_CONFIG, **load_json(CONFIG_PATH, {})}
     for key, env_var in CHANNEL_ENV_VARS.items():
         merged[key] = merged[key] or int(os.environ.get(env_var) or "0")
     return merged
 
 
 def save_config():
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f)
+    save_json(CONFIG_PATH, config)
 
 
-config = load_config()
+def load_hashes():
+    hashes = []
+    for value in load_json(HASHES_PATH, []):
+        try:
+            hashes.append(imagehash.hex_to_hash(value))
+        except ValueError:
+            log.warning("Skipping malformed saved hash: %r", value)
+    return hashes
+
+
+def save_hashes():
+    save_json(HASHES_PATH, [str(h) for h in known_hashes])
+
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("image-watch")
+
+config = load_config()
+known_hashes = load_hashes()  # images a mod marked with /hash-image; a repost of any of them alerts the mod channel
 
 
 class DiscordLogHandler(logging.Handler):
@@ -85,12 +114,45 @@ def is_match(hash1, hash2, threshold):
     return (hash1 - hash2) <= threshold
 
 
+def parse_message_link(value):
+    """Return (channel_id, message_id) from a Discord message link, or None if the text is not one."""
+    parts = value.rstrip("/").split("/")
+    try:
+        return int(parts[-2]), int(parts[-1])
+    except (IndexError, ValueError):
+        return None
+
+
+def find_known_match(img_hash):
+    """Return the first watched hash that matches img_hash, or None."""
+    for seen in known_hashes:
+        if is_match(img_hash, seen, config["hash_threshold"]):
+            return seen
+    return None
+
+
+def hash_image_bytes(data):
+    with Image.open(io.BytesIO(data)) as img:
+        return imagehash.phash(img)
+
+
+async def hash_attachment(attachment):
+    """Return the image hash of an image attachment, or None if it is not an image or cannot be hashed."""
+    if not (attachment.content_type or "").startswith("image/"):
+        return None
+    try:
+        return hash_image_bytes(await attachment.read())
+    except Exception as e:
+        log.warning("Could not hash attachment %s: %s", attachment.filename, e)
+        return None
+
+
 def track_hash(img_hash, username, user_id, tracked=None):
     """Record img_hash against user_id. Strikes only when this user has posted a fuzzy-matching image before."""
     tracked = tracked_users if tracked is None else tracked
     record = tracked.get(user_id)
     if record is None:
-        record = {"username": username, "hashes": [], "strikes": 0, "created_at": datetime.now(timezone.utc), "alerted": False, "activity": []}
+        record = {"username": username, "hashes": [], "strikes": 0, "created_at": datetime.now(timezone.utc), "alerted": False, "activity": [], "hash_alerts": []}
         tracked[user_id] = record
     record["username"] = username
     if any(is_match(img_hash, seen, config["hash_threshold"]) for seen in record["hashes"]):
@@ -235,6 +297,46 @@ async def set_ban_log_channel_command(interaction: discord.Interaction, channel:
     await interaction.response.send_message(f"Ban log channel set to {channel.mention}.", ephemeral=True)
 
 
+@bot.tree.command(name="hash-image", description="Add the images in a linked message to the watch list")
+@discord.app_commands.default_permissions(manage_guild=True)
+async def hash_image_command(interaction: discord.Interaction, message_link: str):
+    parsed = parse_message_link(message_link)
+    if parsed is None:
+        await interaction.response.send_message("Provide a message link (Discord's Copy Message Link).", ephemeral=True)
+        return
+    channel_id, message_id = parsed
+    await interaction.response.defer(ephemeral=True)
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        message = await channel.fetch_message(message_id)
+    except discord.HTTPException:
+        await interaction.followup.send("I could not read that message. Check the link and my channel permissions.", ephemeral=True)
+        return
+    if message.guild is None or message.guild.id != interaction.guild_id:
+        await interaction.followup.send("That link is from another server.", ephemeral=True)
+        return
+    if not message.attachments:
+        await interaction.followup.send("That message has no images.", ephemeral=True)
+        return
+    added = await add_message_hashes(message)
+    save_hashes()
+    if added == 0:
+        await interaction.followup.send("No new images to add.", ephemeral=True)
+        return
+    await interaction.followup.send(f"Added {added} new image hash(es).", ephemeral=True)
+
+
+@bot.tree.command(name="clear-hashes", description="Wipe every image hash from the watch list")
+@discord.app_commands.default_permissions(manage_guild=True)
+async def clear_hashes_command(interaction: discord.Interaction):
+    count = len(known_hashes)
+    known_hashes.clear()
+    for record in tracked_users.values():
+        record["hash_alerts"].clear()
+    save_hashes()
+    await interaction.response.send_message(f"Cleared {count} watched image hash(es).", ephemeral=True)
+
+
 HONEYPOT_PHRASE = "triggered honeypot channel"
 
 
@@ -262,6 +364,28 @@ async def forward_to(message, channel_id, label):
     except discord.HTTPException:
         log.exception("Failed to forward message to %s channel", label)
         return False
+
+
+async def add_message_hashes(message):
+    """Add every new image hash in message to the watch list. Returns how many hashes were added."""
+    added = 0
+    for attachment in message.attachments:
+        img_hash = await hash_attachment(attachment)
+        if img_hash is None or find_known_match(img_hash) is not None:
+            continue
+        known_hashes.append(img_hash)
+        added += 1
+    return added
+
+
+async def handle_watch_hit(message, record, known_hash):
+    """Alert the mod channel once per user per watched image."""
+    key = str(known_hash)
+    if key in record["hash_alerts"]:
+        return
+    record["hash_alerts"].append(key)
+    if not await forward_to(message, config["mod_channel_id"], "Mod"):
+        record["hash_alerts"].remove(key)  # forward failed; let the next repost retry
 
 
 async def handle_strike_limit(message, record):
@@ -301,21 +425,21 @@ async def on_message(message):
         return
 
     record = None
+    watch_hit = None
     for attachment in message.attachments:
-        if not (attachment.content_type or "").startswith("image/"):
-            continue
-        try:
-            data = await attachment.read()
-            with Image.open(io.BytesIO(data)) as img:
-                img_hash = imagehash.phash(img)
-        except Exception as e:
-            log.warning("Could not hash attachment %s: %s", attachment.filename, e)
+        img_hash = await hash_attachment(attachment)
+        if img_hash is None:
             continue
 
         record = track_hash(img_hash, str(message.author), message.author.id)
+        if watch_hit is None:
+            watch_hit = find_known_match(img_hash)
 
     if record:
         record["activity"].append({"time": message.created_at, "channel": message.channel.name})
+
+    if watch_hit is not None:
+        await handle_watch_hit(message, record, watch_hit)
 
     if record and record["strikes"] >= config["strike_limit"]:
         await handle_strike_limit(message, record)
