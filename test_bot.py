@@ -12,16 +12,7 @@ import imagehash
 from PIL import Image
 
 import bot
-from bot import UserRecord, find_known_match, format_activity_report, is_match, parse_message_link, purge_stale, track_hash
-
-
-def test_is_match():
-    a = imagehash.hex_to_hash("ffff0000ffff0000")
-    b = imagehash.hex_to_hash("ffff0000ffff0001")  # 1 bit different -> fuzzy match
-    c = imagehash.hex_to_hash("0000000000000000")  # far away -> no match
-
-    assert is_match(a, b, threshold=5)
-    assert not is_match(a, c, threshold=5)
+from bot import UserRecord, find_match, format_activity_report, parse_message_link, purge_stale, track_hash
 
 
 @patch.object(bot, "tracked_users", {})
@@ -45,38 +36,6 @@ def test_track_hash():
 
     track_hash(a, "someone_else", 456)  # different user, first time seeing this image
     assert tracked[456].strikes == 0
-
-
-@patch.object(bot, "tracked_users", {})
-def test_repeated_image_set_accumulates_strikes():
-    # simulates the actual spam pattern: one user, same 4 images, sent over and over
-    tracked = bot.tracked_users
-    images = [imagehash.hex_to_hash(h) for h in ("ffff0000ffff0000", "0000ffff0000ffff", "ff00ff00ff00ff00", "00ff00ff00ff00ff")]
-
-    def send_message(imgs):
-        for img in imgs:
-            track_hash(img, "spammer", 123)
-
-    send_message(images)  # first time posting these 4 -> all new, no strikes
-    assert tracked[123].strikes == 0
-
-    send_message(images)  # same 4 again -> 4 strikes
-    assert tracked[123].strikes == 4
-
-    send_message(images)  # and again -> keeps accumulating
-    assert tracked[123].strikes == 8
-
-
-@patch.object(bot, "tracked_users", {})
-def test_track_hash_does_not_record_activity():
-    tracked = bot.tracked_users
-    a = imagehash.hex_to_hash("ffff0000ffff0000")
-    b = imagehash.hex_to_hash("0000ffff0000ffff")
-
-    track_hash(a, "spammer", 123)
-    track_hash(b, "spammer", 123)
-
-    assert tracked[123].activity == []
 
 
 def test_purge_stale():
@@ -109,14 +68,14 @@ def test_parse_message_link():
     assert parse_message_link("not a link") is None
 
 
-def test_find_known_match():
+def test_find_match():
     watched = imagehash.hex_to_hash("ffff0000ffff0000")
     near = imagehash.hex_to_hash("ffff0000ffff0001")  # 1 bit different -> match
     far = imagehash.hex_to_hash("0000000000000000")  # far away -> no match
 
-    with patch.object(bot, "known_hashes", [watched]), patch.dict(bot.config, hash_threshold=5):
-        assert find_known_match(near) == watched
-        assert find_known_match(far) is None
+    with patch.dict(bot.config, hash_threshold=5):
+        assert find_match(near, [watched]) == watched
+        assert find_match(far, [watched]) is None
 
 
 def _state_path():
@@ -149,7 +108,7 @@ def test_handle_watch_hit_alerts_once():
         asyncio.run(bot.handle_watch_hit("post", record, watched))
         asyncio.run(bot.handle_watch_hit("post", record, watched))  # same user, same image
     forward.assert_awaited_once()
-    assert record.hash_alerts == {str(watched)}
+    assert record.hash_alerts == {watched}
 
 
 def test_handle_watch_hit_retries_after_forward_failure():

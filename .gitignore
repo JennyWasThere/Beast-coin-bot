@@ -1,6 +1,5 @@
 .env
 config.json
-hashes.json
 *.tmp
 __pycache__/
 *.pyc

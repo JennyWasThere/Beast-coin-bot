@@ -38,56 +38,41 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("image-watch")
 
 
-def load_json(path, default):
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return default
-    except json.JSONDecodeError:
-        log.warning("Could not parse %s; using the default value", path)
-        return default
-    if not isinstance(data, type(default)):
-        log.warning("Ignoring %s: expected %s, got %s", path, type(default).__name__, type(data).__name__)
-        return default
-    return data
-
-
-def save_json(path, data):
-    """Write through a temp file. A crash mid-write must not truncate the saved data."""
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f)
-    os.replace(tmp, path)
-
-
-def parse_hashes(values):
-    hashes = []
-    for value in values:
-        if not isinstance(value, str) or len(value) != 16:  # phash is 64 bits -> 16 hex chars; other shapes crash the compare
-            log.warning("Skipping malformed saved hash: %r", value)
-            continue
-        try:
-            hashes.append(imagehash.hex_to_hash(value))
-        except ValueError:
-            log.warning("Skipping malformed saved hash: %r", value)
-    return hashes
-
-
 def load_state(config_path):
     """Return (config, watched hashes) from config_path."""
-    data = load_json(config_path, {})
+    try:
+        with open(config_path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"expected an object, got {type(data).__name__}")
+    except FileNotFoundError:
+        data = {}
+    except ValueError as e:  # JSONDecodeError is a ValueError
+        log.warning("Ignoring %s: %s", config_path, e)
+        data = {}
     saved_hashes = data.pop("watched_hashes", [])
     config = {**DEFAULT_CONFIG, **data}
     for key, minimum in (("sweep_interval_minutes", 1), ("strike_limit", 1), ("hash_threshold", 0)):
         if not isinstance(config[key], int) or config[key] < minimum:
             log.warning("Ignoring %s=%r: must be an integer of at least %d", key, config[key], minimum)
             config[key] = DEFAULT_CONFIG[key]
-    return config, parse_hashes(saved_hashes if isinstance(saved_hashes, list) else [])
+    hashes = []
+    for value in saved_hashes if isinstance(saved_hashes, list) else []:
+        try:
+            if len(value) != 16:  # phash is 64 bits -> 16 hex chars; other shapes crash the compare
+                raise ValueError
+            hashes.append(imagehash.hex_to_hash(value))
+        except (TypeError, ValueError):
+            log.warning("Skipping malformed saved hash: %r", value)
+    return config, hashes
 
 
 def save_state(path, config, hashes):
-    save_json(path, {**config, "watched_hashes": [str(h) for h in hashes]})
+    """Write through a temp file. A crash mid-write must not truncate the saved data."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({**config, "watched_hashes": [str(h) for h in hashes]}, f)
+    os.replace(tmp, path)
 
 
 config = dict(DEFAULT_CONFIG)  # main() fills this from disk
@@ -95,18 +80,13 @@ known_hashes = []  # images a mod marked with /hash-image; a repost of any of th
 
 
 class DiscordLogHandler(logging.Handler):
-    """Mirrors log records to a Discord channel. emit() is sync, so sending is scheduled as a task."""
+    """Mirrors log records to a Discord channel. emit() is sync, so sending is scheduled as a task.
+    A failed send goes to the asyncio logger, not to log, so it cannot loop back here."""
 
     def emit(self, record):
         channel = bot.get_channel(config["bot_log_channel_id"])
         if channel:
-            bot.loop.create_task(self._send(channel, self.format(record)))
-
-    async def _send(self, channel, msg):
-        try:
-            await channel.send(msg[:2000])
-        except discord.HTTPException:
-            pass
+            bot.loop.create_task(channel.send(self.format(record)[:2000]))
 
 intents = discord.Intents.default()
 intents.message_content = True  # without this, Discord sends empty attachments and embeds; nothing gets watched
@@ -130,10 +110,6 @@ class UserRecord:
 tracked_users = {}  # user_id -> UserRecord
 
 
-def is_match(hash1, hash2, threshold):
-    return (hash1 - hash2) <= threshold
-
-
 def parse_message_link(value):
     """Return (channel_id, message_id) from a Discord message link, or None if the text is not one."""
     parts = value.rstrip("/").split("/")
@@ -143,9 +119,9 @@ def parse_message_link(value):
         return None
 
 
-def find_known_match(img_hash):
-    """Return the first watched hash that matches img_hash, or None."""
-    return next((seen for seen in known_hashes if is_match(img_hash, seen, config["hash_threshold"])), None)
+def find_match(img_hash, hashes):
+    """Return the first hash in hashes that matches img_hash, or None."""
+    return next((seen for seen in hashes if img_hash - seen <= config["hash_threshold"]), None)
 
 
 def hash_image_bytes(data):
@@ -185,7 +161,7 @@ def track_hash(img_hash, username, user_id):
     """Record img_hash against user_id. Strikes only when this user has posted a fuzzy-matching image before."""
     record = tracked_users.setdefault(user_id, UserRecord(username))
     record.username = username
-    if any(is_match(img_hash, seen, config["hash_threshold"]) for seen in record.hashes):
+    if find_match(img_hash, record.hashes) is not None:
         record.strikes += 1
     else:
         record.hashes.append(img_hash)
@@ -231,19 +207,15 @@ async def cleanup_tracked_hashes():
 async def setup_hook():
     guild = discord.Object(GUILD_ID)
     tree.copy_global_to(guild=guild)
-    tree.clear_commands(guild=None)
-    await tree.sync()  # removes the global commands that older versions registered
     await tree.sync(guild=guild)  # server commands update at once; global ones can take an hour
+    handler = DiscordLogHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    log.addHandler(handler)
+    cleanup_tracked_hashes.start()
 
 
 @bot.event
 async def on_ready():
-    if not any(isinstance(h, DiscordLogHandler) for h in log.handlers):
-        handler = DiscordLogHandler()
-        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-        log.addHandler(handler)
-    if not cleanup_tracked_hashes.is_running():
-        cleanup_tracked_hashes.start()
     if bot.get_guild(GUILD_ID) is None:
         log.error("I am not in server %s. Check GUILD_ID. I stay in all servers until it is correct.", GUILD_ID)
     else:
@@ -330,10 +302,7 @@ async def hash_image_command(interaction: discord.Interaction, message_link: str
         return
     added = await add_message_hashes(message)
     save_state(CONFIG_PATH, config, known_hashes)
-    if added == 0:
-        await interaction.followup.send("No new images to add.", ephemeral=True)
-        return
-    await interaction.followup.send(f"Added {added} new image hash(es).", ephemeral=True)
+    await interaction.followup.send(f"Added {added} new image hash(es)." if added else "No new images to add.", ephemeral=True)
 
 
 @tree.command(name="clear-hashes", description="Wipe every image hash from the watch list")
@@ -347,15 +316,12 @@ async def clear_hashes_command(interaction: discord.Interaction):
     await interaction.response.send_message(f"Cleared {count} watched image hash(es).", ephemeral=True)
 
 
-HONEYPOT_PHRASE = "triggered honeypot channel"
-
-
 def is_honeypot_ban_notice(message):
     parts = []
     for embed in message.embeds:
         parts += [embed.title, embed.description]
         parts += [f"{f.name} {f.value}" for f in embed.fields]
-    return any(part and HONEYPOT_PHRASE in part.lower() for part in parts)
+    return any(part and "triggered honeypot channel" in part.lower() for part in parts)
 
 
 async def forward_to(message, channel_id, label):
@@ -371,9 +337,6 @@ async def forward_to(message, channel_id, label):
         return True
     except discord.NotFound:
         return None  # the source message was deleted; a retry cannot help
-    except discord.Forbidden:
-        log.warning("Missing permissions to forward to %s channel %s", label, channel_id)
-        return False
     except discord.HTTPException:
         log.exception("Failed to forward message to %s channel", label)
         return False
@@ -400,7 +363,7 @@ async def add_message_hashes(message):
     added = 0
     for attachment in message.attachments:
         img_hash = await hash_attachment(attachment)
-        if img_hash is None or find_known_match(img_hash) is not None:
+        if img_hash is None or find_match(img_hash, known_hashes) is not None:
             continue
         known_hashes.append(img_hash)
         added += 1
@@ -409,12 +372,11 @@ async def add_message_hashes(message):
 
 async def handle_watch_hit(message, record, known_hash):
     """Alert the mod channel once per user per watched image."""
-    key = str(known_hash)
-    if key in record.hash_alerts:
+    if known_hash in record.hash_alerts:
         return
-    record.hash_alerts.add(key)
+    record.hash_alerts.add(known_hash)
     if not await forward_to(message, config["mod_channel_id"], "Mod"):
-        record.hash_alerts.discard(key)  # forward failed; let the next repost retry
+        record.hash_alerts.discard(known_hash)  # forward failed; let the next repost retry
 
 
 async def handle_strike_limit(message, record):
@@ -460,7 +422,7 @@ async def on_message(message):
 
         record = track_hash(img_hash, str(message.author), message.author.id)
         if watch_hit is None:
-            watch_hit = find_known_match(img_hash)
+            watch_hit = find_match(img_hash, known_hashes)
 
     if record:
         record.activity.append((message.channel.name, message.created_at))
