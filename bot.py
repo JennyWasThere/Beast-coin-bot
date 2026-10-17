@@ -77,6 +77,7 @@ def save_state(path, config, hashes):
 
 config = dict(DEFAULT_CONFIG)  # main() fills this from disk
 known_hashes = []  # images a mod marked with /hash-image; a repost of any of them alerts the mod channel
+http_session = None  # setup_hook opens it; all image downloads share it
 
 
 class DiscordLogHandler(logging.Handler):
@@ -138,11 +139,9 @@ def thumbnail_url(attachment):
 
 
 async def fetch_thumbnail(attachment):
-    # ponytail: one HTTP session per image; share one session if image volume gets high
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-        async with session.get(thumbnail_url(attachment)) as response:
-            response.raise_for_status()
-            return await response.read()
+    async with http_session.get(thumbnail_url(attachment)) as response:
+        response.raise_for_status()
+        return await response.read()
 
 
 async def hash_attachment(attachment):
@@ -205,6 +204,8 @@ async def cleanup_tracked_hashes():
 
 @bot.event
 async def setup_hook():
+    global http_session
+    http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
     guild = discord.Object(GUILD_ID)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)  # server commands update at once; global ones can take an hour
