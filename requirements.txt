@@ -1,4 +1,4 @@
-discord.py
-Pillow
-imagehash
-python-dotenv
+discord.py==2.7.1
+Pillow==12.3.0
+imagehash==4.3.2
+python-dotenv==1.2.2

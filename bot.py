@@ -4,12 +4,15 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 import discord
 import imagehash
-from discord.ext import commands, tasks
+from discord.ext import tasks
 from dotenv import load_dotenv
 from PIL import Image
+
+Image.MAX_IMAGE_PIXELS = 20_000_000  # reject huge decoded images; a small file can decode to a giant bitmap
 
 load_dotenv()
 
@@ -26,23 +29,21 @@ DEFAULT_CONFIG = {
     "bot_log_channel_id": 0,
     "ban_log_channel_id": 0,
 }
-# channel ids may also come from the environment on first run, before any slash command has set them in the config file
-CHANNEL_ENV_VARS = {
-    "mod_channel_id": "MOD_CHANNEL_ID",
-    "bot_log_channel_id": "BOT_LOG_CHANNEL_ID",
-    "ban_log_channel_id": "BAN_LOG_CHANNEL_ID",
-}
 
 
 def load_json(path, default):
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
     except FileNotFoundError:
         return default
     except json.JSONDecodeError:
         log.warning("Could not parse %s; using the default value", path)
         return default
+    if not isinstance(data, type(default)):
+        log.warning("Ignoring %s: expected %s, got %s", path, type(default).__name__, type(data).__name__)
+        return default
+    return data
 
 
 def save_json(path, data):
@@ -53,20 +54,35 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
+def parse_channel_id(env_var):
+    raw = os.environ.get(env_var)
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        startup_warnings.append(f"Ignoring {env_var}={raw!r}: not a channel id")
+        return 0
+
+
 def load_config():
     merged = {**DEFAULT_CONFIG, **load_json(CONFIG_PATH, {})}
-    for key, env_var in CHANNEL_ENV_VARS.items():
-        merged[key] = merged[key] or int(os.environ.get(env_var) or "0")
+    # channel ids may also come from the environment on first run, before any slash command has set them in the config file
+    for key in ("mod_channel_id", "bot_log_channel_id", "ban_log_channel_id"):
+        merged[key] = merged[key] or parse_channel_id(key.upper())
+    for key, minimum in (("sweep_interval_minutes", 1), ("strike_limit", 1), ("hash_threshold", 0)):
+        if not isinstance(merged[key], int) or merged[key] < minimum:
+            startup_warnings.append(f"Ignoring {key}={merged[key]!r}: must be an integer of at least {minimum}")
+            merged[key] = DEFAULT_CONFIG[key]
     return merged
-
-
-def save_config():
-    save_json(CONFIG_PATH, config)
 
 
 def load_hashes():
     hashes = []
     for value in load_json(HASHES_PATH, []):
+        if not isinstance(value, str) or len(value) != 16:  # phash is 64 bits -> 16 hex chars; other shapes crash the compare
+            log.warning("Skipping malformed saved hash: %r", value)
+            continue
         try:
             hashes.append(imagehash.hex_to_hash(value))
         except ValueError:
@@ -81,6 +97,7 @@ def save_hashes():
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("image-watch")
 
+startup_warnings = []  # config problems found before the Discord log handler exists; flushed in on_ready
 config = load_config()
 known_hashes = load_hashes()  # images a mod marked with /hash-image; a repost of any of them alerts the mod channel
 
@@ -88,14 +105,10 @@ known_hashes = load_hashes()  # images a mod marked with /hash-image; a repost o
 class DiscordLogHandler(logging.Handler):
     """Mirrors log records to a Discord channel. emit() is sync, so sending is scheduled as a task."""
 
-    def __init__(self, bot):
-        super().__init__()
-        self.bot = bot
-
     def emit(self, record):
-        channel = self.bot.get_channel(config["bot_log_channel_id"]) if config["bot_log_channel_id"] else None
+        channel = bot.get_channel(config["bot_log_channel_id"])
         if channel:
-            self.bot.loop.create_task(self._send(channel, self.format(record)))
+            bot.loop.create_task(self._send(channel, self.format(record)))
 
     async def _send(self, channel, msg):
         try:
@@ -104,8 +117,9 @@ class DiscordLogHandler(logging.Handler):
             pass
 
 intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)  # required by commands.Bot; unused, all commands are slash commands
+intents.message_content = True  # without this, Discord sends empty attachments and embeds; nothing gets watched
+bot = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(bot)
 
 tracked_users = {}  # user_id -> {username, hashes: [imagehash,...], strikes, created_at}
 
@@ -125,10 +139,7 @@ def parse_message_link(value):
 
 def find_known_match(img_hash):
     """Return the first watched hash that matches img_hash, or None."""
-    for seen in known_hashes:
-        if is_match(img_hash, seen, config["hash_threshold"]):
-            return seen
-    return None
+    return next((seen for seen in known_hashes if is_match(img_hash, seen, config["hash_threshold"])), None)
 
 
 def hash_image_bytes(data):
@@ -141,19 +152,19 @@ async def hash_attachment(attachment):
     if not (attachment.content_type or "").startswith("image/"):
         return None
     try:
-        return hash_image_bytes(await attachment.read())
+        data = await attachment.read()
+        return await asyncio.to_thread(hash_image_bytes, data)  # hashing is CPU-bound; keep it off the event loop
     except Exception as e:
         log.warning("Could not hash attachment %s: %s", attachment.filename, e)
         return None
 
 
-def track_hash(img_hash, username, user_id, tracked=None):
+def track_hash(img_hash, username, user_id):
     """Record img_hash against user_id. Strikes only when this user has posted a fuzzy-matching image before."""
-    tracked = tracked_users if tracked is None else tracked
-    record = tracked.get(user_id)
+    record = tracked_users.get(user_id)
     if record is None:
         record = {"username": username, "hashes": [], "strikes": 0, "created_at": datetime.now(timezone.utc), "alerted": False, "activity": [], "hash_alerts": []}
-        tracked[user_id] = record
+        tracked_users[user_id] = record
     record["username"] = username
     if any(is_match(img_hash, seen, config["hash_threshold"]) for seen in record["hashes"]):
         record["strikes"] += 1
@@ -165,10 +176,7 @@ def track_hash(img_hash, username, user_id, tracked=None):
 def purge_stale(tracked, ttl_minutes, now):
     cutoff = now - timedelta(minutes=ttl_minutes)
     stale_keys = [key for key, record in tracked.items() if record["created_at"] < cutoff]
-    removed = []
-    for key in stale_keys:
-        removed.append((key, tracked.pop(key)))
-    return removed
+    return [tracked.pop(key) for key in stale_keys]
 
 
 def format_activity_report(record):
@@ -179,10 +187,10 @@ def format_activity_report(record):
 
 async def report_expired_activity(records):
     """Log each removed user's activity to the bot log channel when they met the strike limit."""
-    channel = bot.get_channel(config["bot_log_channel_id"]) if config["bot_log_channel_id"] else None
+    channel = bot.get_channel(config["bot_log_channel_id"])
     if not channel:
         return
-    for _, record in records:
+    for record in records:
         if record["strikes"] < config["strike_limit"]:
             continue
         try:
@@ -203,101 +211,65 @@ async def cleanup_tracked_hashes():
 @bot.event
 async def on_ready():
     if not any(isinstance(h, DiscordLogHandler) for h in log.handlers):
-        handler = DiscordLogHandler(bot)
+        handler = DiscordLogHandler()
         handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
         log.addHandler(handler)
+    for warning in startup_warnings:
+        log.warning(warning)
+    startup_warnings.clear()
     if not cleanup_tracked_hashes.is_running():
         cleanup_tracked_hashes.start()
-    await bot.tree.sync()
+    await tree.sync()
     log.info("Logged in as %s", bot.user)
 
 
-GITHUB_URL = "https://github.com/JennyWasThere/Beast-coin-bot"
-
-
-@bot.tree.command(name="about", description="Get the link to this bot's source code")
-@discord.app_commands.checks.cooldown(1, 60.0)
+@tree.command(name="about", description="Get the link to this bot's source code")
 async def about_command(interaction: discord.Interaction):
-    await interaction.response.send_message(GITHUB_URL)
+    await interaction.response.send_message("https://github.com/JennyWasThere/Beast-coin-bot", ephemeral=True)
 
 
-@about_command.error
-async def about_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
-    if isinstance(error, discord.app_commands.CommandOnCooldown):
-        await interaction.response.send_message(str(error), ephemeral=True)
-    else:
-        raise error
-
-
-@bot.tree.command(name="purge", description="Manually purge all tracked users now")
+@tree.command(name="purge", description="Manually purge all tracked users now")
 @discord.app_commands.default_permissions(manage_guild=True)
 async def purge_command(interaction: discord.Interaction):
-    removed = list(tracked_users.items())
+    removed = list(tracked_users.values())
     tracked_users.clear()
     await interaction.response.send_message(f"Purged {len(removed)} tracked user(s).", ephemeral=True)
-    if removed:
-        await report_expired_activity(removed)
+    await report_expired_activity(removed)
 
 
-@bot.tree.command(name="set-strike-threshold", description="Set how many strikes trigger an alert")
+@tree.command(name="set-threshold", description="Set how many strikes trigger an alert, or how close two images must be to match")
 @discord.app_commands.default_permissions(manage_guild=True)
-async def set_strike_threshold_command(interaction: discord.Interaction, threshold: int):
-    if threshold < 1:
-        await interaction.response.send_message("Threshold must be at least 1.", ephemeral=True)
+async def set_threshold_command(
+    interaction: discord.Interaction, kind: Literal["strike", "hash"], threshold: discord.app_commands.Range[int, 0]
+):
+    if kind == "strike" and threshold < 1:  # a strike limit of 0 alerts on every image
+        await interaction.response.send_message("Strike threshold must be at least 1.", ephemeral=True)
         return
-    config["strike_limit"] = threshold
-    save_config()
-    await interaction.response.send_message(f"Strike threshold set to {threshold}.", ephemeral=True)
+    config["strike_limit" if kind == "strike" else "hash_threshold"] = threshold
+    save_json(CONFIG_PATH, config)
+    await interaction.response.send_message(f"{kind.capitalize()} threshold set to {threshold}.", ephemeral=True)
 
 
-@bot.tree.command(name="set-hash-threshold", description="Set how close two images' hashes must be to count as a match")
+@tree.command(name="set-sweep-interval", description="Set how often (in minutes) stale tracked users are purged")
 @discord.app_commands.default_permissions(manage_guild=True)
-async def set_hash_threshold_command(interaction: discord.Interaction, threshold: int):
-    if threshold < 0:
-        await interaction.response.send_message("Threshold must be at least 0.", ephemeral=True)
-        return
-    config["hash_threshold"] = threshold
-    save_config()
-    await interaction.response.send_message(f"Hash threshold set to {threshold}.", ephemeral=True)
-
-
-@bot.tree.command(name="set-sweep-interval", description="Set how often (in minutes) stale tracked users are purged")
-@discord.app_commands.default_permissions(manage_guild=True)
-async def set_sweep_interval_command(interaction: discord.Interaction, minutes: int):
-    if minutes < 1:
-        await interaction.response.send_message("Interval must be at least 1 minute.", ephemeral=True)
-        return
+async def set_sweep_interval_command(interaction: discord.Interaction, minutes: discord.app_commands.Range[int, 1]):
     config["sweep_interval_minutes"] = minutes
-    save_config()
+    save_json(CONFIG_PATH, config)
     cleanup_tracked_hashes.change_interval(minutes=minutes)
     await interaction.response.send_message(f"Sweep interval set to {minutes} minute(s).", ephemeral=True)
 
 
-@bot.tree.command(name="set-mod-channel", description="Set the channel where strike alerts are forwarded")
+@tree.command(name="set-channel", description="Set the mod, bot log, or ban log channel")
 @discord.app_commands.default_permissions(manage_guild=True)
-async def set_mod_channel_command(interaction: discord.Interaction, channel: discord.TextChannel):
-    config["mod_channel_id"] = channel.id
-    save_config()
-    await interaction.response.send_message(f"Mod channel set to {channel.mention}.", ephemeral=True)
+async def set_channel_command(
+    interaction: discord.Interaction, kind: Literal["mod", "bot_log", "ban_log"], channel: discord.TextChannel
+):
+    config[f"{kind}_channel_id"] = channel.id
+    save_json(CONFIG_PATH, config)
+    await interaction.response.send_message(f"{kind} channel set to {channel.mention}.", ephemeral=True)
 
 
-@bot.tree.command(name="set-bot-log-channel", description="Set the channel where bot logs are mirrored")
-@discord.app_commands.default_permissions(manage_guild=True)
-async def set_bot_log_channel_command(interaction: discord.Interaction, channel: discord.TextChannel):
-    config["bot_log_channel_id"] = channel.id
-    save_config()
-    await interaction.response.send_message(f"Bot log channel set to {channel.mention}.", ephemeral=True)
-
-
-@bot.tree.command(name="set-ban-log-channel", description="Set the channel where honeypot ban notices are forwarded")
-@discord.app_commands.default_permissions(manage_guild=True)
-async def set_ban_log_channel_command(interaction: discord.Interaction, channel: discord.TextChannel):
-    config["ban_log_channel_id"] = channel.id
-    save_config()
-    await interaction.response.send_message(f"Ban log channel set to {channel.mention}.", ephemeral=True)
-
-
-@bot.tree.command(name="hash-image", description="Add the images in a linked message to the watch list")
+@tree.command(name="hash-image", description="Add the images in a linked message to the watch list")
 @discord.app_commands.default_permissions(manage_guild=True)
 async def hash_image_command(interaction: discord.Interaction, message_link: str):
     parsed = parse_message_link(message_link)
@@ -315,9 +287,6 @@ async def hash_image_command(interaction: discord.Interaction, message_link: str
     if message.guild is None or message.guild.id != interaction.guild_id:
         await interaction.followup.send("That link is from another server.", ephemeral=True)
         return
-    if not message.attachments:
-        await interaction.followup.send("That message has no images.", ephemeral=True)
-        return
     added = await add_message_hashes(message)
     save_hashes()
     if added == 0:
@@ -326,7 +295,7 @@ async def hash_image_command(interaction: discord.Interaction, message_link: str
     await interaction.followup.send(f"Added {added} new image hash(es).", ephemeral=True)
 
 
-@bot.tree.command(name="clear-hashes", description="Wipe every image hash from the watch list")
+@tree.command(name="clear-hashes", description="Wipe every image hash from the watch list")
 @discord.app_commands.default_permissions(manage_guild=True)
 async def clear_hashes_command(interaction: discord.Interaction):
     count = len(known_hashes)
@@ -349,8 +318,9 @@ def is_honeypot_ban_notice(message):
 
 
 async def forward_to(message, channel_id, label):
-    """Forward message to channel_id. Returns True on success; logs a warning/exception and returns False otherwise."""
-    channel = bot.get_channel(channel_id) if channel_id else None
+    """Forward message to channel_id.
+    Returns True on success, False on a failure that can retry, and None if the source message is gone."""
+    channel = bot.get_channel(channel_id)
     if not channel:
         if channel_id:
             log.warning("%s channel %s not found", label, channel_id)
@@ -358,11 +328,29 @@ async def forward_to(message, channel_id, label):
     try:
         await message.forward(channel)
         return True
+    except discord.NotFound:
+        return None  # the source message was deleted; a retry cannot help
     except discord.Forbidden:
         log.warning("Missing permissions to forward to %s channel %s", label, channel_id)
         return False
     except discord.HTTPException:
         log.exception("Failed to forward message to %s channel", label)
+        return False
+
+
+async def send_fallback_alert(message):
+    """Send a text alert when the offending message is deleted and cannot be forwarded."""
+    channel = bot.get_channel(config["mod_channel_id"])
+    if not channel:
+        return False
+    try:
+        await channel.send(
+            f"{message.author} (id {message.author.id}) hit the strike limit in {message.channel.mention}, "
+            "but their message was deleted before I could forward it."
+        )
+        return True
+    except discord.HTTPException:
+        log.exception("Failed to send fallback strike alert to Mod channel")
         return False
 
 
@@ -390,7 +378,6 @@ async def handle_watch_hit(message, record, known_hash):
 
 async def handle_strike_limit(message, record):
     if record["alerted"]:
-        log.debug("Skipping alert for %s: already alerted", message.author)
         return
     record["alerted"] = True  # claim it now, before the sleep, so a concurrent duplicate can't slip through
 
@@ -400,11 +387,13 @@ async def handle_strike_limit(message, record):
         try:
             await message.guild.fetch_member(message.author.id)
         except discord.NotFound:
-            log.debug("Skipping alert for %s: no longer in the server", message.author)
             record["alerted"] = False  # if they rejoin and spam again, we should still catch it
             return
 
-        if not await forward_to(message, config["mod_channel_id"], "Mod"):
+        result = await forward_to(message, config["mod_channel_id"], "Mod")
+        if result is None:
+            result = await send_fallback_alert(message)  # message is gone; alert by user instead
+        if not result:
             record["alerted"] = False
     except Exception:
         log.exception("Alert flow failed for %s; will retry on next qualifying message", message.author)
@@ -417,11 +406,8 @@ async def on_message(message):
         return
 
     if message.author.bot:
-        if message.channel.id == config["bot_log_channel_id"] and message.embeds and is_honeypot_ban_notice(message):
+        if message.channel.id == config["bot_log_channel_id"] and is_honeypot_ban_notice(message):
             await forward_to(message, config["ban_log_channel_id"], "Ban log")
-        return
-
-    if not message.attachments:
         return
 
     record = None

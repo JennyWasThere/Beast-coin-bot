@@ -44,16 +44,16 @@ flags repeat offenders and forwards ban notices for review.
 ## Commands
 
 - `/about`: link to this repo.
-- `/purge`: clear out stale tracked users now.
-- `/set-strike-threshold`: set how many matching posts trigger an alert.
-- `/set-hash-threshold`: set how similar two images must be to count as a
+- `/purge`: clear all tracked users now.
+- `/set-threshold kind:strike`: set how many matching posts trigger an alert.
+- `/set-threshold kind:hash`: set how similar two images must be to count as a
   match.
 - `/set-sweep-interval`: set how long (in minutes) the bot keeps a user's
   strike history.
-- `/set-mod-channel`: set where flagged messages get forwarded.
-- `/set-bot-log-channel`: set where the bot's internal logs get mirrored,
-  and where the bot watches for honeypot ban notices.
-- `/set-ban-log-channel`: set where honeypot ban notices get forwarded.
+- `/set-channel kind:mod`: set where flagged messages get forwarded.
+- `/set-channel kind:bot_log`: set where the bot's internal logs get
+  mirrored, and where the bot watches for honeypot ban notices.
+- `/set-channel kind:ban_log`: set where honeypot ban notices get forwarded.
 - `/hash-image`: add the images in a message from this server to the watch
   list.
 - `/clear-hashes`: wipe every watched image hash.
