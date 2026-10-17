@@ -119,50 +119,26 @@ def test_find_known_match():
         assert find_known_match(far) is None
 
 
-def _state_paths():
-    folder = tempfile.mkdtemp()
-    return os.path.join(folder, "config.json"), os.path.join(folder, "hashes.json")
+def _state_path():
+    return os.path.join(tempfile.mkdtemp(), "config.json")
 
 
 def test_state_round_trip():
-    config_path, hashes_path = _state_paths()
+    path = _state_path()
     h = imagehash.hex_to_hash("ffff0000ffff0000")
-    bot.save_state(config_path, {**bot.DEFAULT_CONFIG, "strike_limit": 3}, [h])
-    cfg, hashes = bot.load_state(config_path, hashes_path)
+    bot.save_state(path, {**bot.DEFAULT_CONFIG, "strike_limit": 3}, [h])
+    cfg, hashes = bot.load_state(path)
     assert cfg["strike_limit"] == 3
     assert hashes == [h]
 
 
-def test_load_state_migrates_old_layout_once():
-    config_path, hashes_path = _state_paths()
-    with open(config_path, "w") as f:
-        json.dump({"strike_limit": 4, "mod_channel_id": 0}, f)
-    with open(hashes_path, "w") as f:
-        json.dump(["ffff0000ffff0000", None, 123, "ffff"], f)  # malformed entries are skipped
-
-    with patch.dict(os.environ, MOD_CHANNEL_ID="111"):
-        cfg, hashes = bot.load_state(config_path, hashes_path)
-    assert cfg["strike_limit"] == 4
-    assert cfg["mod_channel_id"] == 111  # env seeds a channel the old config file lacked
-    assert hashes == [imagehash.hex_to_hash("ffff0000ffff0000")]
-    with open(config_path) as f:
-        assert json.load(f)["watched_hashes"] == ["ffff0000ffff0000"]
-
-    os.remove(hashes_path)
-    with patch.dict(os.environ, MOD_CHANNEL_ID="222"):
-        cfg, hashes = bot.load_state(config_path, hashes_path)
-    assert cfg["mod_channel_id"] == 111  # after migration the environment is ignored
-    assert len(hashes) == 1  # the old hash file is no longer needed
-
-
 def test_load_state_survives_bad_values():
-    config_path, hashes_path = _state_paths()
-    with open(config_path, "w") as f:
-        json.dump({"sweep_interval_minutes": -5}, f)
-    with patch.dict(os.environ, MOD_CHANNEL_ID="#general"):
-        cfg, _ = bot.load_state(config_path, hashes_path)
-    assert cfg["mod_channel_id"] == 0
+    path = _state_path()
+    with open(path, "w") as f:
+        json.dump({"sweep_interval_minutes": -5, "watched_hashes": ["ffff0000ffff0000", None, 123, "ffff"]}, f)
+    cfg, hashes = bot.load_state(path)
     assert cfg["sweep_interval_minutes"] == bot.DEFAULT_CONFIG["sweep_interval_minutes"]
+    assert hashes == [imagehash.hex_to_hash("ffff0000ffff0000")]  # malformed entries are skipped
 
 
 def test_handle_watch_hit_alerts_once():

@@ -75,7 +75,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ## Project Quick Facts
 
 - `bot.py` is the whole bot: a single-file Discord bot in `discord.py`.
-- Settings and watched hashes live in `config.json` (gitignored, created at runtime). `main()` loads them into `config` and `known_hashes`. The first start reads channel IDs from `.env`. See `.env.example` for the full list of variables.
+- Settings and watched hashes live in `config.json` (gitignored, created at runtime). `main()` loads them into `config` and `known_hashes`. See `.env.example` for the full list of variables.
 - The bot serves one server, set by `GUILD_ID`.
 - Run the bot: `python bot.py`. Run the tests: `python test_bot.py` (plain `assert`-based, no pytest required, though pytest also works if installed).
 - Slash commands that change settings require "Manage Server" permission.

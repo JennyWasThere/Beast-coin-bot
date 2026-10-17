@@ -65,15 +65,12 @@ The `set-*`, `hash-image`, `clear-hashes`, and `purge` commands require the
 ## Setup
 
 1. Copy `.env.example` to `.env`. Fill in `DISCORD_TOKEN` and `GUILD_ID`.
-   Optionally set `MOD_CHANNEL_ID`, `BOT_LOG_CHANNEL_ID`, and
-   `BAN_LOG_CHANNEL_ID`. The bot reads these only on the first start.
 2. Run `pip install -r requirements.txt`.
 3. Run `python bot.py`.
+4. Run `/set-channel` for the mod, bot log, and ban log channels.
 
 The bot serves one server: the server in `GUILD_ID`. The bot leaves any other
 server that adds it. Slash commands register in that server only.
 
 Settings and watched image hashes save to `config.json`. This file survives
-restarts when it sits on a mounted volume. An older version of the bot kept
-the hashes in a separate `hashes.json`. On the first start, the bot moves
-those hashes into `config.json`. After that, the bot ignores `hashes.json`.
+restarts when it sits on a mounted volume.

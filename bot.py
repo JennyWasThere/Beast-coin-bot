@@ -22,11 +22,8 @@ load_dotenv()
 TOKEN = os.environ.get("DISCORD_TOKEN", "")
 GUILD_ID = int(os.environ.get("GUILD_ID") or 0)  # the one server this bot serves
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")  # settings and watched hashes; persists across restarts
-LEGACY_HASHES_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "hashes.json")  # old separate hash file; read once to migrate
 BAN_GRACE_SECONDS = 10  # the moderation bot gets this long to ban a user before the strike alert goes out
 THUMBNAIL_SIZE = 128  # phash shrinks every image to 32x32, so a small copy gives the same hash
-
-CHANNEL_KEYS = ("mod_channel_id", "bot_log_channel_id", "ban_log_channel_id")
 
 DEFAULT_CONFIG = {
     "sweep_interval_minutes": 10,  # how long a tracked entry survives; also the cleanup sweep interval, both adjustable via slash commands
@@ -64,17 +61,6 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
-def parse_channel_id(env_var):
-    raw = os.environ.get(env_var)
-    if not raw:
-        return 0
-    try:
-        return int(raw)
-    except ValueError:
-        log.warning("Ignoring %s=%r: not a channel id", env_var, raw)
-        return 0
-
-
 def parse_hashes(values):
     hashes = []
     for value in values:
@@ -88,26 +74,16 @@ def parse_hashes(values):
     return hashes
 
 
-def load_state(config_path, legacy_hashes_path):
-    """Return (config, watched hashes) from config_path.
-    The first run of this version migrates the old layout: hashes in a separate file, channel ids in the environment."""
+def load_state(config_path):
+    """Return (config, watched hashes) from config_path."""
     data = load_json(config_path, {})
-    saved_hashes = data.pop("watched_hashes", None)
-    migrating = saved_hashes is None
-    if migrating:
-        saved_hashes = load_json(legacy_hashes_path, [])
-        for key in CHANNEL_KEYS:
-            data[key] = data.get(key) or parse_channel_id(key.upper())
+    saved_hashes = data.pop("watched_hashes", [])
     config = {**DEFAULT_CONFIG, **data}
     for key, minimum in (("sweep_interval_minutes", 1), ("strike_limit", 1), ("hash_threshold", 0)):
         if not isinstance(config[key], int) or config[key] < minimum:
             log.warning("Ignoring %s=%r: must be an integer of at least %d", key, config[key], minimum)
             config[key] = DEFAULT_CONFIG[key]
-    hashes = parse_hashes(saved_hashes if isinstance(saved_hashes, list) else [])
-    if migrating:
-        save_state(config_path, config, hashes)
-        log.info("Saved settings and %d watched hash(es) to %s", len(hashes), config_path)
-    return config, hashes
+    return config, parse_hashes(saved_hashes if isinstance(saved_hashes, list) else [])
 
 
 def save_state(path, config, hashes):
@@ -499,7 +475,7 @@ async def on_message(message):
 def main():
     if not GUILD_ID:
         raise SystemExit("Set GUILD_ID to the id of the server this bot serves.")
-    loaded_config, loaded_hashes = load_state(CONFIG_PATH, LEGACY_HASHES_PATH)
+    loaded_config, loaded_hashes = load_state(CONFIG_PATH)
     config.update(loaded_config)
     known_hashes[:] = loaded_hashes
     cleanup_tracked_hashes.change_interval(minutes=config["sweep_interval_minutes"])
