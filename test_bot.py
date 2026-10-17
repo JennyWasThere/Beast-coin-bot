@@ -12,7 +12,7 @@ import imagehash
 from PIL import Image
 
 import bot
-from bot import find_known_match, format_activity_report, is_match, parse_message_link, purge_stale, track_hash
+from bot import UserRecord, find_known_match, format_activity_report, is_match, parse_message_link, purge_stale, track_hash
 
 
 def test_is_match():
@@ -32,19 +32,19 @@ def test_track_hash():
     c = imagehash.hex_to_hash("0000000000000000")  # far from a/b -> distinct image
 
     track_hash(a, "spammer", 123)
-    assert tracked[123]["strikes"] == 0
-    assert len(tracked[123]["hashes"]) == 1
+    assert tracked[123].strikes == 0
+    assert len(tracked[123].hashes) == 1
 
     track_hash(b, "spammer", 123)  # same user reposts a fuzzy-matching image
-    assert tracked[123]["strikes"] == 1
-    assert len(tracked[123]["hashes"]) == 1  # repeat, not a new entry in their list
+    assert tracked[123].strikes == 1
+    assert len(tracked[123].hashes) == 1  # repeat, not a new entry in their list
 
     track_hash(c, "spammer", 123)  # same user, but a genuinely new image
-    assert tracked[123]["strikes"] == 1  # no strike for a first sighting
-    assert len(tracked[123]["hashes"]) == 2
+    assert tracked[123].strikes == 1  # no strike for a first sighting
+    assert len(tracked[123].hashes) == 2
 
     track_hash(a, "someone_else", 456)  # different user, first time seeing this image
-    assert tracked[456]["strikes"] == 0
+    assert tracked[456].strikes == 0
 
 
 @patch.object(bot, "tracked_users", {})
@@ -58,13 +58,13 @@ def test_repeated_image_set_accumulates_strikes():
             track_hash(img, "spammer", 123)
 
     send_message(images)  # first time posting these 4 -> all new, no strikes
-    assert tracked[123]["strikes"] == 0
+    assert tracked[123].strikes == 0
 
     send_message(images)  # same 4 again -> 4 strikes
-    assert tracked[123]["strikes"] == 4
+    assert tracked[123].strikes == 4
 
     send_message(images)  # and again -> keeps accumulating
-    assert tracked[123]["strikes"] == 8
+    assert tracked[123].strikes == 8
 
 
 @patch.object(bot, "tracked_users", {})
@@ -76,13 +76,13 @@ def test_track_hash_does_not_record_activity():
     track_hash(a, "spammer", 123)
     track_hash(b, "spammer", 123)
 
-    assert tracked[123]["activity"] == []
+    assert tracked[123].activity == []
 
 
 def test_purge_stale():
     now = datetime.now(timezone.utc)
-    stale = {"created_at": now - timedelta(minutes=11)}
-    tracked = {123: stale, 456: {"created_at": now - timedelta(minutes=1)}}
+    stale = UserRecord("old", created_at=now - timedelta(minutes=11))
+    tracked = {123: stale, 456: UserRecord("new", created_at=now - timedelta(minutes=1))}
 
     removed = purge_stale(tracked, ttl_minutes=10, now=now)
 
@@ -91,13 +91,10 @@ def test_purge_stale():
 
 
 def test_format_activity_report():
-    record = {
-        "username": "spammer",
-        "activity": [
-            {"time": datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc), "channel": "memes"},
-            {"time": datetime(2024, 1, 1, 12, 5, tzinfo=timezone.utc), "channel": "general"},
-        ],
-    }
+    record = UserRecord("spammer", activity=[
+        ("memes", datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)),
+        ("general", datetime(2024, 1, 1, 12, 5, tzinfo=timezone.utc)),
+    ])
 
     report = format_activity_report(record)
 
@@ -122,52 +119,80 @@ def test_find_known_match():
         assert find_known_match(far) is None
 
 
-def test_hash_round_trip():
+def _state_paths():
+    folder = tempfile.mkdtemp()
+    return os.path.join(folder, "config.json"), os.path.join(folder, "hashes.json")
+
+
+def test_state_round_trip():
+    config_path, hashes_path = _state_paths()
     h = imagehash.hex_to_hash("ffff0000ffff0000")
-    with patch.object(bot, "HASHES_PATH", os.path.join(tempfile.mkdtemp(), "hashes.json")), patch.object(bot, "known_hashes", [h]):
-        bot.save_hashes()
-        assert bot.load_hashes() == [h]
+    bot.save_state(config_path, {**bot.DEFAULT_CONFIG, "strike_limit": 3}, [h])
+    cfg, hashes = bot.load_state(config_path, hashes_path)
+    assert cfg["strike_limit"] == 3
+    assert hashes == [h]
 
 
-def test_load_hashes_skips_malformed_entries():
-    with patch.object(bot, "HASHES_PATH", os.path.join(tempfile.mkdtemp(), "hashes.json")):
-        with open(bot.HASHES_PATH, "w") as f:
-            json.dump(["ffff0000ffff0000", None, 123, "ffff"], f)
-        assert bot.load_hashes() == [imagehash.hex_to_hash("ffff0000ffff0000")]
+def test_load_state_migrates_old_layout_once():
+    config_path, hashes_path = _state_paths()
+    with open(config_path, "w") as f:
+        json.dump({"strike_limit": 4, "mod_channel_id": 0}, f)
+    with open(hashes_path, "w") as f:
+        json.dump(["ffff0000ffff0000", None, 123, "ffff"], f)  # malformed entries are skipped
+
+    with patch.dict(os.environ, MOD_CHANNEL_ID="111"):
+        cfg, hashes = bot.load_state(config_path, hashes_path)
+    assert cfg["strike_limit"] == 4
+    assert cfg["mod_channel_id"] == 111  # env seeds a channel the old config file lacked
+    assert hashes == [imagehash.hex_to_hash("ffff0000ffff0000")]
+    with open(config_path) as f:
+        assert json.load(f)["watched_hashes"] == ["ffff0000ffff0000"]
+
+    os.remove(hashes_path)
+    with patch.dict(os.environ, MOD_CHANNEL_ID="222"):
+        cfg, hashes = bot.load_state(config_path, hashes_path)
+    assert cfg["mod_channel_id"] == 111  # after migration the environment is ignored
+    assert len(hashes) == 1  # the old hash file is no longer needed
 
 
-def test_load_config_survives_bad_values():
-    path = os.path.join(tempfile.mkdtemp(), "config.json")
-    with open(path, "w") as f:
+def test_load_state_survives_bad_values():
+    config_path, hashes_path = _state_paths()
+    with open(config_path, "w") as f:
         json.dump({"sweep_interval_minutes": -5}, f)
-    with patch.object(bot, "CONFIG_PATH", path), patch.object(bot, "startup_warnings", []), \
-            patch.dict(os.environ, MOD_CHANNEL_ID="#general"):
-        cfg = bot.load_config()
-        assert cfg["mod_channel_id"] == 0
-        assert cfg["sweep_interval_minutes"] == bot.DEFAULT_CONFIG["sweep_interval_minutes"]
-        assert len(bot.startup_warnings) == 2  # both bad values were reported
+    with patch.dict(os.environ, MOD_CHANNEL_ID="#general"):
+        cfg, _ = bot.load_state(config_path, hashes_path)
+    assert cfg["mod_channel_id"] == 0
+    assert cfg["sweep_interval_minutes"] == bot.DEFAULT_CONFIG["sweep_interval_minutes"]
 
 
 def test_handle_watch_hit_alerts_once():
     forward = AsyncMock(return_value=True)
-    record = {"hash_alerts": []}
+    record = UserRecord("spammer")
     watched = imagehash.hex_to_hash("ffff0000ffff0000")
     with patch.object(bot, "forward_to", forward):
         asyncio.run(bot.handle_watch_hit("post", record, watched))
         asyncio.run(bot.handle_watch_hit("post", record, watched))  # same user, same image
     forward.assert_awaited_once()
-    assert record["hash_alerts"] == [str(watched)]
+    assert record.hash_alerts == {str(watched)}
 
 
 def test_handle_watch_hit_retries_after_forward_failure():
-    record = {"hash_alerts": []}
+    record = UserRecord("spammer")
     with patch.object(bot, "forward_to", AsyncMock(return_value=False)):
         asyncio.run(bot.handle_watch_hit("post", record, imagehash.hex_to_hash("ffff0000ffff0000")))
-    assert record["hash_alerts"] == []  # not claimed, so the next repost tries again
+    assert record.hash_alerts == set()  # not claimed, so the next repost tries again
 
 
 def _attachment(data):
-    return SimpleNamespace(content_type="image/png", filename="image.png", read=AsyncMock(return_value=data))
+    return SimpleNamespace(content_type="image/png", filename="image.png", width=16, height=16, data=data)
+
+
+def test_thumbnail_url_keeps_signature_and_aspect_ratio():
+    attachment = SimpleNamespace(width=1000, height=500, proxy_url="https://media.discordapp.net/a/b.png?ex=1&hm=2")
+    assert bot.thumbnail_url(attachment) == "https://media.discordapp.net/a/b.png?ex=1&hm=2&width=128&height=64"
+
+    small = SimpleNamespace(width=40, height=20, proxy_url="https://media.discordapp.net/a/b.png")
+    assert bot.thumbnail_url(small) == "https://media.discordapp.net/a/b.png?width=40&height=20"  # never upscale
 
 
 def test_add_message_hashes():
@@ -175,7 +200,8 @@ def test_add_message_hashes():
     Image.new("RGB", (16, 16), "red").save(buf, format="PNG")
     png = buf.getvalue()
 
-    with patch.object(bot, "known_hashes", []):
+    with patch.object(bot, "known_hashes", []), \
+            patch.object(bot, "fetch_thumbnail", AsyncMock(side_effect=lambda a: a.data)):
         message = SimpleNamespace(attachments=[_attachment(png), _attachment(b"not an image")])
         assert asyncio.run(bot.add_message_hashes(message)) == 1
         assert len(bot.known_hashes) == 1
@@ -194,13 +220,13 @@ def test_forward_to_returns_none_when_message_deleted():
 def test_handle_strike_limit_alerts_by_user_when_message_gone():
     message = SimpleNamespace(author=SimpleNamespace(id=123), guild=SimpleNamespace(fetch_member=AsyncMock()))
     fallback = AsyncMock(return_value=True)
-    record = {"alerted": False}
+    record = UserRecord("spammer")
     with patch.object(bot, "forward_to", AsyncMock(return_value=None)), \
             patch.object(bot, "send_fallback_alert", fallback), patch.object(bot.asyncio, "sleep", AsyncMock()):
         asyncio.run(bot.handle_strike_limit(message, record))
 
     fallback.assert_awaited_once_with(message)
-    assert record["alerted"] is True
+    assert record.alerted is True
 
 
 def test_hash_image_rejects_other_guild():
@@ -215,6 +241,16 @@ def test_hash_image_rejects_other_guild():
 
     interaction.followup.send.assert_awaited_once_with("That link is from another server.", ephemeral=True)
     assert bot.known_hashes == before
+
+
+def test_leaves_only_other_servers():
+    home = SimpleNamespace(id=1, name="home", leave=AsyncMock())
+    other = SimpleNamespace(id=2, name="other", leave=AsyncMock())
+    with patch.object(bot, "GUILD_ID", 1):
+        asyncio.run(bot.on_guild_join(home))
+        asyncio.run(bot.on_guild_join(other))
+    home.leave.assert_not_awaited()
+    other.leave.assert_awaited_once()
 
 
 if __name__ == "__main__":
